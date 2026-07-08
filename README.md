@@ -18,11 +18,8 @@ The code is released to support methodological transparency, reproducibility, an
 ## Repository Structure
 
 ```text
-.
+
 ├── main_model/
-├── experiments/
-│   ├── baselines/
-│   └── baseline_models/
 └── README.md
 ```
 
@@ -37,21 +34,6 @@ Contains the final implementation of the proposed model used in the manuscript:
 * Data transformation utilities
 * Bundled public configuration defaults
 * Runtime and training utilities
-
-### `experiments/baselines/`
-
-Contains orchestration utilities for the retained V0 and V1 baseline experiments.
-
-### `experiments/baseline_models/`
-
-Contains the baseline model implementations retained for the manuscript comparison:
-
-* ResNet1D
-* ShallowFBCSPNet
-* VGG1D
-* MSNN
-
-Only Python source files and this README are intended to be tracked in the public repository.
 
 ## Data Availability and Exclusions
 
