@@ -1,1 +1,170 @@
+import os
+import sys
+import pandas as pd
+import numpy as np
+import mne
+from mne.io import read_raw_edf
 
+DATASET_PATH = 
+ANNOTATION_FILE = 
+SIGNAL_PATH =
+OUTPUT_FILE =
+# 19개 채널
+TARGET_CHANNELS = [
+    'Fp1', 'F3', 'C3', 'P3', 'O1',
+    'Fp2', 'F4', 'C4', 'P4', 'O2',
+    'F7', 'T3', 'T5', 'F8', 'T4',
+    'T6', 'Fz', 'Cz', 'Pz'
+]
+
+CLASS_MAP = {'CN': 0, 'MCI': 1, 'AD': 2, 'Dementia': 3}
+
+
+def is_true(value):
+    if pd.isna(value): return False
+    if value is True or value == 1 or value == 1.0: return True
+    if isinstance(value, str) and value.strip().lower() == 'true': return True
+    return False
+
+def check_cols(row, cols):
+    for c in cols:
+        if is_true(row.get(c)): return True
+    return False
+
+def get_class_label(row):
+    if is_true(row.get('ad')) or is_true(row.get('load')) or is_true(row.get('eoad')):
+        return CLASS_MAP['AD']
+    dem_cols = ['dementia', 'vd', 'sivd', 'ftd', 'bvftd', 'language_ftd',
+                'parkinson_dementia', 'nph', 'lbd', 'cjd', 'ad_vd_mixed',
+                'psp', 'cbs', 'pca', 'alcohol_dementia']
+    if check_cols(row, dem_cols):
+        return CLASS_MAP['Dementia']
+    mci_cols = ['mci', 'mci_ad', 'mci_amnestic', 'mci_non_amnestic',
+                'mci_amnestic_ef', 'mci_amnestic_rf', 'mci_multi_domain', 'mci_vascular']
+    if check_cols(row, mci_cols):
+        return CLASS_MAP['MCI']
+    cn_cols = ['normal', 'cb_normal', 'hc_normal', 'smi']
+    if check_cols(row, cn_cols):
+        return CLASS_MAP['CN']
+    return None
+
+def get_edf_path(row):
+    try:
+        serial_val = row['serial']
+        if pd.isna(serial_val): return None
+        serial_str = str(int(serial_val)).zfill(5)
+        return os.path.join(SIGNAL_PATH, f"{serial_str}.edf")
+    except:
+        return None
+
+
+def main():
+    mne.set_log_level('ERROR')
+    print(f"데이터셋 경로: {DATASET_PATH}")
+    
+    if not os.path.exists(ANNOTATION_FILE):
+        print("엑셀 파일을 찾을 수 없습니다.")
+        return
+
+    df = pd.read_excel(ANNOTATION_FILE)
+
+    # --- [1단계] 스캔 ---
+    print("\n>>> [1단계] 데이터 스캔 중...")
+    valid_files = []
+    total_epochs = 0
+
+    for idx, row in df.iterrows():
+        if idx % 100 == 0:
+            print(f"    스캔 중: {idx}/{len(df)}...", end='\r')
+
+        label_idx = get_class_label(row)
+        if label_idx is None: continue
+
+        edf_path = get_edf_path(row)
+        if edf_path and os.path.exists(edf_path):
+            try:
+                raw_info = read_raw_edf(edf_path, preload=False, verbose=False)
+                n_epochs = int(raw_info.times[-1] // 4.0)
+                
+                # 환자 ID (Serial) 추출 (예: 1388)
+                pid = int(row['serial']) 
+
+                if n_epochs > 0:
+                    valid_files.append((edf_path, label_idx, pid, n_epochs))
+                    total_epochs += n_epochs
+            except:
+                pass
+    
+    print(f"\n    스캔 완료. 총 {total_epochs} 윈도우.")
+
+    print("\n>>> 생성 시작 (환자 ID 포함)")
+    
+    compound_dtype = [
+        ('X', 'float32', (19, 800)),  # 데이터
+        ('y', 'int64'),               # 라벨 (0,1,2,3)
+        ('pid', 'int64')              # 환자 ID (예: 1388)
+    ]
+
+    if os.path.exists(OUTPUT_FILE):
+        os.remove(OUTPUT_FILE)
+
+    mm_array = np.lib.format.open_memmap(OUTPUT_FILE, mode='w+', dtype=compound_dtype, shape=(total_epochs,))
+
+    current_idx = 0
+    total_files = len(valid_files)
+
+    for i, (edf_path, label_idx, pid, _) in enumerate(valid_files):
+        try:
+            raw = read_raw_edf(edf_path, preload=True, verbose=False)
+            
+            rename_dict = {ch: ch.replace('EEG ', '').replace('-REF', '').replace('-AVG', '') for ch in raw.ch_names}
+            raw.rename_channels(rename_dict)
+            
+            curr_chs = raw.ch_names
+            upper_target = {ch.upper(): ch for ch in TARGET_CHANNELS}
+            rename_map = {}
+            for ch in curr_chs:
+                if ch not in TARGET_CHANNELS and ch.upper() in upper_target:
+                    rename_map[ch] = upper_target[ch.upper()]
+            if rename_map: raw.rename_channels(rename_map)
+
+            raw.set_montage('standard_1020', on_missing='ignore')
+            raw.pick(TARGET_CHANNELS)
+            
+            # CAR 재참조
+            raw.set_eeg_reference('average', projection=True, verbose=False)
+            raw.apply_proj(verbose=False)
+            
+            # 필터링
+            iir_params = dict(order=4, ftype='butter')
+            raw.filter(l_freq=0.5, h_freq=45.0, method='iir', iir_params=iir_params, verbose=False)
+
+            if raw.info['sfreq'] != 200:
+                raw.resample(200, verbose=False)
+
+            epochs = mne.make_fixed_length_epochs(raw, duration=4.0, preload=True, verbose=False)
+            data = epochs.get_data(copy=False).astype(np.float32) * 1e6 # uV 변환
+
+            n_data = data.shape[0]
+
+            if current_idx + n_data <= total_epochs:
+                mm_array[current_idx: current_idx + n_data]['X'] = data
+                mm_array[current_idx: current_idx + n_data]['y'] = label_idx
+                # ★ 여기서 환자 ID도 같이 저장!
+                mm_array[current_idx: current_idx + n_data]['pid'] = pid 
+                
+                current_idx += n_data
+
+            sys.stdout.write(f"\r[{i + 1}/{total_files}] 저장 중... ID:{pid}     ")
+            sys.stdout.flush()
+            
+            del raw, epochs, data
+
+        except Exception as e:
+            print(f"\nSkip {edf_path}: {e}")
+
+    del mm_array
+    print(f"\n완료! 저장된 파일: {OUTPUT_FILE}")
+
+if __name__ == '__main__':
+    main()
